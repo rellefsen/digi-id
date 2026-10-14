@@ -33,6 +33,9 @@ def main() -> int:
     demo = subprocess.run([sys.executable, str(ROOT / "tests" / "live_from_file_demo.py")], cwd=ROOT)
     if demo.returncode != 0:
         return demo.returncode
+    slots = subprocess.run([sys.executable, str(ROOT / "tests" / "test_ft8_slots.py")], cwd=ROOT)
+    if slots.returncode != 0:
+        return slots.returncode
     print("smoke OK:", c.mode, dec.lines)
     return 0
 

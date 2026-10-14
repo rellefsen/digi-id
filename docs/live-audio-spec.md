@@ -140,8 +140,10 @@ Block size defaults to 480 frames at 48 kHz (10 ms). The monitor software queue
 is two blocks (~20 ms), inside the 80 ms budget. Classify/decode never runs
 on the capture callback.
 
-FT8 windows are 15 s of captured audio measured from the start of the stream
-(not UTC slot aligned). A real on-air decode may lag one period.
+FT8 windows on a sound device are 15 s periods aligned to UTC
+(`:00`, `:15`, `:30`, `:45`). Audio before the first boundary is not
+decoded, so the first text can lag one period. `--live-from-file` measures
+15 s from the start of the file. `--ft8-align utc|stream` overrides that.
 
 ## 8. Offline / safety
 

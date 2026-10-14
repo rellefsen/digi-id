@@ -57,11 +57,10 @@ python3 -m digimode --live --device default --live-mode listen+decode \
 
 - **No capture or playback device** on this box (`sounddevice.query_devices()` is empty: ALSA and OSS, zero devices). `--device` is implemented and raises `LiveUnavailableError` with a pointer at `--live-from-file` / `--list-devices`. It was not exercised against a radio, virtual cable, or `snd-aloop`.
 - **Monitor cannot be heard here.** The playback `OutputStream` path is real and falls back to a no-op that still applies squelch zeros when open would have played.
-- **FT8 windows are counted from stream start**, not aligned to UTC 15 s slots. A live on-air FT8 transmission can be split across two windows and missed until the next period (the allowed one-period lag). `--live-from-file` on a single 15 s `ft8sim` WAV matches one window and decodes.
+- **FT8 device windows follow UTC 15 s slots** (`:00`, `:15`, `:30`, `:45`). Capture drops the partial slot before the first boundary (up to one period), then each full period goes to `jt9`. The grid is anchored to the clock at the first block and then follows the sample count, so a long session can drift by the sound-card error. A start up to 50 ms after a boundary is kept, rather than skipping the rest of that slot. `--live-from-file` still counts from the start of the file, so a single 15 s `ft8sim` WAV stays one window. `--ft8-align utc` forces the UTC grid on a file; `--ft8-align stream` forces the stream clock on a device.
 - **Weak-signal squelch:** this FT8 sample will not open a +6 dB squelch. Use `--squelch-policy always-on` (or lower `--squelch-open-db`) to decode it. That matches the spec.
 - JS8Call still out of scope. RTTY/PSK31 decode is still the stub. Classifier is unchanged heuristics.
 
 ## Left for later
 
-- UTC-aligned FT8 periods for `--device`.
 - Hotkeys. Olivia / JS8 / digi-voice. IQ ingest.
