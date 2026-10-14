@@ -6,7 +6,9 @@ Three consumers read that ring and never open the input device again:
 
   * squelched monitor playback (immediate mute)
   * optional pre-squelch WAV writer
-  * classify / FT8 windows on a worker thread (same ingest + jt9 path as files)
+  * classify / FT8 windows on a worker thread (same ingest + jt9 path as files).
+    Device capture cuts FT8 on UTC 15 s slots; file playback stays on the
+    stream clock unless ft8_align is "utc".
 
 No network sockets. See docs/live-audio-spec.md.
 """
@@ -18,6 +20,7 @@ import queue
 import threading
 import time
 import wave
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -29,6 +32,7 @@ from digimode.classify import classify
 from digimode.decode import get_ft8_decoder
 from digimode.decode.ft8_jt9 import Ft8Jt9Decoder
 from digimode.decode.stub import StubDecoder
+from digimode.ft8_slots import Ft8Window, Ft8WindowCutter, capture_epoch_utc
 from digimode.ingest import AudioBuffer, load_wav
 
 
@@ -66,6 +70,22 @@ def parse_live_mode(mode: str) -> LiveMode:
             f"unknown live mode {mode!r}; expected listen-only, decode-only, or listen+decode"
         )
     return mapping[key]
+
+
+def parse_ft8_align(mode: str, *, from_file: bool) -> bool:
+    """Resolve ``auto|utc|stream`` to whether windows lock to UTC slots.
+
+    ``auto`` follows the input: a sound device uses UTC, a file uses the
+    stream clock so a one-period WAV still decodes.
+    """
+    key = mode.strip().lower().replace("_", "-")
+    if key == "auto":
+        return not from_file
+    if key == "utc":
+        return True
+    if key == "stream":
+        return False
+    raise ValueError(f"unknown FT8 alignment {mode!r}; expected auto, utc, or stream")
 
 
 def parse_squelch_policy(policy: str) -> SquelchPolicy:
@@ -137,6 +157,10 @@ class LiveStatus:
     decode_attempts: int = 0
     decode_skipped_gate: int = 0
     input_backend: str = ""
+    ft8_align_utc: bool = False
+    ft8_lead_in_frames: int = 0
+    ft8_hold_s: float = 0.0
+    ft8_slots: int = 0
 
 
 @dataclass
@@ -155,6 +179,11 @@ class LiveConfig:
     pace_realtime: bool = True
     classify_interval_s: float = 0.75
     ft8_window_s: float = 15.0
+    # Device capture locks periods to UTC. File playback stays on the
+    # stream clock unless the caller sets this true.
+    ft8_align_utc: bool = True
+    ft8_epoch_utc: float | None = None
+    utc_clock: Callable[[], float] | None = None
     max_seconds: float | None = None
     jt9_path: str | None = None
     ring_seconds: float = 60.0
@@ -590,11 +619,15 @@ def format_status(st: LiveStatus) -> str:
         cls = "-"
     dec = st.last_decode_line or "-"
     mode = MODE_LABEL.get(st.mode, str(st.mode.value if isinstance(st.mode, LiveMode) else st.mode))
+    if st.ft8_align_utc:
+        ft8 = f"utc wait={st.ft8_hold_s:.1f}s" if st.ft8_hold_s >= 0.05 else "utc"
+    else:
+        ft8 = "stream"
     return (
         f"status: mode={mode} squelch={sq} floor={floor} level={level} "
         f"record={rec} class={cls} decode={dec} "
         f"device={st.device or '-'} monitor={st.monitor_backend} "
-        f"latency_ms={st.monitor_latency_ms:.1f}"
+        f"latency_ms={st.monitor_latency_ms:.1f} ft8={ft8}"
     )
 
 
@@ -615,6 +648,7 @@ class LiveSession:
             record_path=str(self.config.record_path) if self.config.record_path else None,
             device=self.config.device,
             message="ready",
+            ft8_align_utc=bool(self.config.ft8_align_utc),
         )
         self._status_lock = threading.Lock()
         self._stop_lock = threading.Lock()
@@ -640,14 +674,9 @@ class LiveSession:
         self._capture_overruns = 0
         self._capture_opens = 0
         self._input_backend = ""
-        self._ft8_chunks: list[NDArray[np.float32]] = []
-        self._ft8_n = 0
-        self._ft8_need = 0
-        self._ft8_latch_mode = LiveMode.BOTH
-        self._ft8_latch_force = "auto"
-        self._ft8_latch_policy = SquelchPolicy.GATE_OFF
-        self._ft8_frame0 = 0
-        self._ft8_window_open = False
+        self._ft8: Ft8WindowCutter | None = None
+        self._ft8_align = bool(self.config.ft8_align_utc)
+        self._epoch_locked = False
         self._class_since = 0
         self._class_need = 0
         self._class_latch_mode = LiveMode.BOTH
@@ -701,9 +730,19 @@ class LiveSession:
 
         self._ring = RingBuffer(ring_frames)
         self.squelch = NoiseSquelch(cfg.squelch, sr)
-        self._ft8_need = max(1, int(round(cfg.ft8_window_s * sr)))
+        self._ft8_align = bool(cfg.ft8_align_utc)
+        self._epoch_locked = False
+        self._ft8 = Ft8WindowCutter(
+            sr,
+            period_s=float(cfg.ft8_window_s),
+            align_utc=self._ft8_align,
+            on_begin=self._latch_ft8,
+        )
+        if cfg.ft8_epoch_utc is not None:
+            self._ft8.set_epoch(float(cfg.ft8_epoch_utc))
+            self._epoch_locked = True
         self._class_need = max(1, int(round(cfg.classify_interval_s * sr)))
-        self._roll_max = self._ft8_need
+        self._roll_max = self._ft8.window_frames
         self._captured = 0
         self._mon_frames = 0
         self._mon_audible = 0
@@ -711,9 +750,6 @@ class LiveSession:
         self._an_frames = 0
         self._capture_overruns = 0
         self._capture_opens = 0
-        self._ft8_chunks = []
-        self._ft8_n = 0
-        self._ft8_window_open = False
         self._class_since = 0
         self._class_interval_open = False
         self._roll = []
@@ -734,6 +770,10 @@ class LiveSession:
             self._status.last_confidence = None
             self._status.decode_attempts = 0
             self._status.decode_skipped_gate = 0
+            self._status.ft8_align_utc = self._ft8_align
+            self._status.ft8_lead_in_frames = 0
+            self._status.ft8_hold_s = 0.0
+            self._status.ft8_slots = 0
 
         if cfg.record_path is not None:
             self._wav = PcmWavWriter(Path(cfg.record_path), sr)
@@ -870,6 +910,12 @@ class LiveSession:
             st.analysis_frames = self._an_frames
             st.capture_opens = self._capture_opens
             st.input_backend = self._input_backend
+            st.ft8_align_utc = self._ft8_align
+            cutter = self._ft8
+            if cutter is not None:
+                st.ft8_lead_in_frames = int(cutter.lead_in_frames)
+                st.ft8_slots = int(cutter.slots)
+                st.ft8_hold_s = cutter.hold_frames / float(self.config.sample_rate)
             ring = self._ring
             st.overruns = self._capture_overruns + (ring.overruns if ring is not None else 0)
             if player is not None:
@@ -901,6 +947,7 @@ class LiveSession:
         pos = 0
         n = int(samples.size)
         next_t = time.perf_counter()
+        self._stamp_capture_clock(0, None)
         try:
             while pos < n and not self._stop.is_set():
                 end = min(pos + bs, n)
@@ -932,11 +979,14 @@ class LiveSession:
             channels = ch + 1
         self._capture_ch = ch
 
-        def callback(indata, frames, time_info, status) -> None:  # noqa: ARG001
+        def callback(indata, frames, time_info, status) -> None:
             if self._stop.is_set():
                 return
             if status:
                 self._capture_overruns += 1
+            if int(frames) <= 0:
+                return
+            self._stamp_capture_clock(int(frames), time_info)
             if getattr(indata, "ndim", 1) == 2:
                 use = self._capture_ch if self._capture_ch < indata.shape[1] else 0
                 mono = indata[:, use]
@@ -1030,9 +1080,9 @@ class LiveSession:
                     else:
                         time.sleep(0.002)
                         continue
-                start = self._an_frames
+                abs_frame = int(pos) - int(data.size)
                 self._an_frames += int(data.size)
-                self._consume_analysis(data, start)
+                self._consume_analysis(data, abs_frame)
             self._flush_analysis()
         except Exception as exc:  # noqa: BLE001 — keep capture alive; report on status
             with self._status_lock:
@@ -1078,25 +1128,39 @@ class LiveSession:
             self._class_since = 0
             self._class_interval_open = False
 
-        offset = 0
-        while offset < data.size:
-            if not self._ft8_window_open:
-                self._begin_ft8_window(frame0 + offset)
-            space = self._ft8_need - self._ft8_n
-            take = min(space, int(data.size) - offset)
-            piece = data[offset : offset + take]
-            self._ft8_chunks.append(piece)
-            self._ft8_n += take
-            offset += take
-            if self._ft8_n >= self._ft8_need:
-                self._finish_ft8_window(partial=False)
+        cutter = self._ft8
+        if cutter is None:
+            return
+        for window in cutter.push(data, frame0):
+            self._submit_ft8_window(window)
 
-    def _begin_ft8_window(self, frame0: int) -> None:
-        self._ft8_latch_mode = self.config.mode
-        self._ft8_latch_force = self.config.force_mode
-        self._ft8_latch_policy = self.config.squelch.policy
-        self._ft8_frame0 = int(frame0)
-        self._ft8_window_open = True
+    def _latch_ft8(self, frame0: int) -> tuple[LiveMode, str, SquelchPolicy]:
+        """Mode and squelch policy freeze when a period opens, not when it ends."""
+        del frame0
+        return (self.config.mode, self.config.force_mode, self.config.squelch.policy)
+
+    def _stamp_capture_clock(self, block_frames: int, time_info: object) -> None:
+        """Record the Unix time of capture frame 0, once, before samples are analyzed."""
+        if not self._ft8_align or self._epoch_locked or self._ft8 is None:
+            return
+        sr = int(self.config.sample_rate)
+        delay = (int(block_frames) / float(sr)) if sr > 0 and int(block_frames) > 0 else 0.0
+        if time_info is not None:
+            try:
+                current = float(time_info.currentTime)  # type: ignore[attr-defined]
+                adc = float(time_info.inputBufferAdcTime)  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001
+                current = adc = None
+            # Host APIs that cannot time the ADC report both clocks as 0.
+            # Keep the one-block estimate in that case.
+            if current is not None and adc is not None and not (current == 0.0 and adc == 0.0):
+                measured = current - adc
+                if math.isfinite(measured) and 0.0 <= measured <= 1.0:
+                    delay = measured
+        clock = self.config.utc_clock or time.time
+        epoch = capture_epoch_utc(clock(), self._captured, sr, delay)
+        self._ft8.set_epoch(epoch)
+        self._epoch_locked = True
 
     def _window_saw_open(self, start: int, end: int) -> bool:
         if self.squelch is None:
@@ -1119,20 +1183,14 @@ class LiveSession:
             self._status.last_mode_label = result.mode
             self._status.last_confidence = float(result.confidence)
 
-    def _finish_ft8_window(self, partial: bool) -> None:
-        chunks = self._ft8_chunks
-        n = self._ft8_n
-        mode = self._ft8_latch_mode
-        force = self._ft8_latch_force
-        policy = self._ft8_latch_policy
-        frame0 = self._ft8_frame0
-        self._ft8_chunks = []
-        self._ft8_n = 0
-        self._ft8_window_open = False
-        if n <= 0 or not chunks:
+    def _submit_ft8_window(self, window: Ft8Window) -> None:
+        latched = window.latch
+        if not isinstance(latched, tuple) or len(latched) != 3:
             return
-        # A short tail at EOF is not an FT8 period. Keep near-full windows.
-        if partial and n < int(0.9 * self._ft8_need):
+        mode, force, policy = latched
+        n = int(window.samples.size)
+        frame0 = int(window.frame0)
+        if n <= 0:
             return
         saw = self._window_saw_open(frame0, frame0 + n)
         if mode == LiveMode.LISTEN:
@@ -1142,12 +1200,11 @@ class LiveSession:
                 self._status.decode_skipped_gate += 1
                 self._status.message = "decode skipped (squelch gate-off)"
             return
-        samples = chunks[0] if len(chunks) == 1 else np.concatenate(chunks)
         self._jobs.put(
             _DecodeJob(
-                samples=np.asarray(samples, dtype=np.float32).copy(),
+                samples=np.asarray(window.samples, dtype=np.float32).copy(),
                 sample_rate=int(self.config.sample_rate),
-                force_mode=force,
+                force_mode=str(force),
             )
         )
 
@@ -1156,8 +1213,11 @@ class LiveSession:
             self._run_classify(self._class_frame0, self._class_frame0 + self._class_since)
             self._class_since = 0
             self._class_interval_open = False
-        if self._ft8_n > 0:
-            self._finish_ft8_window(partial=True)
+        cutter = self._ft8
+        if cutter is not None:
+            tail = cutter.flush()
+            if tail is not None:
+                self._submit_ft8_window(tail)
 
     def _decode_loop(self) -> None:
         while True:
@@ -1232,6 +1292,9 @@ def live_listen_record(
     output_device: str | None = None,
     max_seconds: float | None = None,
     jt9_path: str | None = None,
+    ft8_align: str = "auto",
+    ft8_epoch_utc: float | None = None,
+    utc_clock: Callable[[], float] | None = None,
 ) -> LiveSession:
     """
     Convenience constructor for listen + optional WAV record + decode tee.
@@ -1252,6 +1315,9 @@ def live_listen_record(
         pace_realtime=pace_realtime,
         max_seconds=max_seconds,
         jt9_path=jt9_path,
+        ft8_align_utc=parse_ft8_align(ft8_align, from_file=from_file is not None),
+        ft8_epoch_utc=ft8_epoch_utc,
+        utc_clock=utc_clock,
         squelch=SquelchConfig(
             open_db=squelch_open_db,
             close_db=squelch_close_db,

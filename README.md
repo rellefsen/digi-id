@@ -67,6 +67,7 @@ python3 -m digimode --list-devices
 # real input (ALSA/PortAudio device index or name substring)
 python3 -m digimode --live --device default --live-mode listen+decode \
   --squelch-policy always-on --record /tmp/digimode-live.wav
+# device FT8 windows lock to UTC :00/:15/:30/:45 (--ft8-align stream to disable)
 
 # no radio: push a WAV through the same ring buffer
 python3 -m digimode --live \
@@ -149,7 +150,7 @@ docs/
 
 - Classifier is fingerprint-based; crowded bands need better features later.
 - Only FT8 text decode; RTTY/PSK31 = classify + stub.
-- Live FT8 periods follow the stream clock, not UTC 15 s slots, so an on-air signal can straddle a window.
+- Live device FT8 periods follow UTC 15 s slots. File playback follows the stream clock unless `--ft8-align utc`.
 - This box has no ALSA capture/playback device, so monitor output no-ops until one exists.
 - No SDR IQ. No JS8Call.
 

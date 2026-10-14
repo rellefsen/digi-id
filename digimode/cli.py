@@ -100,6 +100,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="With --live-from-file, do not pace the feed in real time",
     )
+    p.add_argument(
+        "--ft8-align",
+        choices=("auto", "utc", "stream"),
+        default="auto",
+        help="FT8 period alignment. auto: UTC 15 s slots for a sound device, "
+        "stream start for --live-from-file",
+    )
     p.add_argument("-V", "--version", action="version", version=f"digimode {__version__}")
     return p
 
@@ -150,6 +157,7 @@ def _run_live(args) -> int:
             output_device=args.output_device,
             max_seconds=args.seconds,
             jt9_path=args.jt9,
+            ft8_align=args.ft8_align,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)

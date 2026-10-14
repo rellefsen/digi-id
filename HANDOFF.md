@@ -27,7 +27,7 @@ Target modes:
 | Operating modes | Done. `listen-only`, `decode-only`, `listen+decode`; monitor changes immediately, decode at next window |
 | Recording | Done. `--record path.wav`, 16-bit pre-squelch, verified 720000 frames at 48 kHz |
 | Real sound device (`--device`) | Implemented, **untested on hardware**. RTO's computer has no audio devices; the monitor no-ops there |
-| FT8 UTC slot alignment | **Not done.** Windows count from stream start, so on-air FT8 may split across windows |
+| FT8 UTC slot alignment | Done for `--device` (and `--ft8-align utc`). Drops the partial leading slot, then cuts on Unix 15 s boundaries. `--live-from-file` stays on the stream clock unless asked |
 | JS8, Olivia, MFSK, digital voice, IQ ingest, hotkeys | Not started |
 | Communications log | Specified for the Android app, not built |
 | Android app | Strategy only, no code yet |
@@ -80,8 +80,7 @@ Note: `--mode` is the force-mode override (`auto|FT8|RTTY|PSK31`); `--live-mode`
 
 ## Suggested next tasks for Cursor
 
-1. Align FT8 windows to UTC 15 s slots for `--device` input.
-2. Test `--device` with real hardware or `snd-aloop`.
-3. Replace RTTY/PSK31 stubs (fldigi engine or native demod).
-4. Add the DMR branch with encrypted-flag detection.
-5. Start the Android shell: AudioRecord tee + JNI FT8.
+1. Test `--device` with real hardware or `snd-aloop`.
+2. Replace RTTY/PSK31 stubs (fldigi engine or native demod).
+3. Add the DMR branch with encrypted-flag detection.
+4. Start the Android shell: AudioRecord tee + JNI FT8.
